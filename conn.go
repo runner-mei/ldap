@@ -9,9 +9,10 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"github.com/mmitton/asn1-ber"
 	"net"
 	"sync"
+
+	"github.com/mmitton/asn1-ber"
 )
 
 // LDAP Connection
@@ -254,7 +255,9 @@ func (l *Conn) processMessages() {
 }
 
 func (l *Conn) closeAllChannels() {
-	fmt.Printf("closeAllChannels\n")
+	if l.Debug {
+		fmt.Printf("closeAllChannels\n")
+	}
 	for MessageID, Channel := range l.chanResults {
 		if l.Debug {
 			fmt.Printf("Closing channel for MessageID %d\n", MessageID)
@@ -300,6 +303,18 @@ func (l *Conn) reader() {
 
 func (l *Conn) sendProcessMessage(message *messagePacket) {
 	if l.chanProcessMessage != nil {
-		go func() { l.chanProcessMessage <- message }()
+		//go func() {
+		select {
+		case l.chanProcessMessage <- message:
+		default:
+			go func() {
+				defer func() {
+					if o := recover(); nil != o {
+						fmt.Println("[ldap] panic at", o)
+					}
+				}()
+				l.chanProcessMessage <- message
+			}()
+		}
 	}
 }
