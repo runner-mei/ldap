@@ -8,6 +8,7 @@ package ldap
 import (
 	"errors"
 	"fmt"
+
 	"github.com/mmitton/asn1-ber"
 )
 
@@ -169,10 +170,10 @@ func (l *Conn) SearchWithPaging(SearchRequest *SearchRequest, PagingSize uint32)
 }
 
 func (l *Conn) Search(SearchRequest *SearchRequest) (*SearchResult, *Error) {
-	messageID := l.nextMessageID()
+	request_id := l.nextMessageID()
 
-	packet := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "LDAP Request")
-	packet.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimative, ber.TagInteger, messageID, "MessageID"))
+	request_packet := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "LDAP Request")
+	request_packet.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimative, ber.TagInteger, request_id, "MessageID"))
 	searchRequest := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ApplicationSearchRequest, nil, "Search Request")
 	searchRequest.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimative, ber.TagOctetString, SearchRequest.BaseDN, "Base DN"))
 	searchRequest.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimative, ber.TagEnumerated, uint64(SearchRequest.Scope), "Scope"))
@@ -190,23 +191,18 @@ func (l *Conn) Search(SearchRequest *SearchRequest) (*SearchResult, *Error) {
 		attributesPacket.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimative, ber.TagOctetString, attribute, "Attribute"))
 	}
 	searchRequest.AppendChild(attributesPacket)
-	packet.AppendChild(searchRequest)
+	request_packet.AppendChild(searchRequest)
 	if SearchRequest.Controls != nil {
-		packet.AppendChild(encodeControls(SearchRequest.Controls))
+		request_packet.AppendChild(encodeControls(SearchRequest.Controls))
 	}
 
 	if l.Debug {
-		ber.PrintPacket(packet)
+		ber.PrintPacket(request_packet)
 	}
 
-	channel, err := l.sendMessage(packet)
-	if err != nil {
-		return nil, err
+	if err := l.send(request_packet); err != nil {
+		return nil, NewError(ErrorNetwork, err)
 	}
-	if channel == nil {
-		return nil, NewError(ErrorNetwork, errors.New("Could not send message"))
-	}
-	defer l.finishMessage(messageID)
 
 	result := &SearchResult{
 		Entries:   make([]*Entry, 0),
@@ -216,28 +212,34 @@ func (l *Conn) Search(SearchRequest *SearchRequest) (*SearchResult, *Error) {
 	foundSearchResultDone := false
 	for !foundSearchResultDone {
 		if l.Debug {
-			fmt.Printf("%d: waiting for response\n", messageID)
+			fmt.Printf("%d: waiting for response\n", request_id)
 		}
-		packet = <-channel
+		response_id, response_packet, err := l.read()
 		if l.Debug {
-			fmt.Printf("%d: got response %p\n", messageID, packet)
+			fmt.Printf("%d: got response %p\n", request_id, response_packet)
 		}
-		if packet == nil {
-			return nil, NewError(ErrorNetwork, errors.New("Could not retrieve message"))
+		if nil != err {
+			return nil, NewError(ErrorNetwork, err)
 		}
 
 		if l.Debug {
-			if err := addLDAPDescriptions(packet); err != nil {
+			if err := addLDAPDescriptions(response_packet); err != nil {
 				return nil, NewError(ErrorDebugging, err)
 			}
-			ber.PrintPacket(packet)
+			ber.PrintPacket(response_packet)
+		}
+		if request_id != response_id {
+			if l.Debug {
+				fmt.Printf("%d: got response and response id is not excepted %p\n", request_id, response_id)
+			}
+			continue
 		}
 
-		switch packet.Children[1].Tag {
+		switch response_packet.Children[1].Tag {
 		case 4:
 			entry := new(Entry)
-			entry.DN = packet.Children[1].Children[0].Value.(string)
-			for _, child := range packet.Children[1].Children[1].Children {
+			entry.DN = response_packet.Children[1].Children[0].Value.(string)
+			for _, child := range response_packet.Children[1].Children[1].Children {
 				attr := new(EntryAttribute)
 				attr.Name = child.Children[0].Value.(string)
 				for _, value := range child.Children[1].Children {
@@ -247,23 +249,22 @@ func (l *Conn) Search(SearchRequest *SearchRequest) (*SearchResult, *Error) {
 			}
 			result.Entries = append(result.Entries, entry)
 		case 5:
-			result_code, result_description := getLDAPResultCode(packet)
+			result_code, result_description := getLDAPResultCode(response_packet)
 			if result_code != 0 {
 				return result, NewError(result_code, errors.New(result_description))
 			}
-			if len(packet.Children) == 3 {
-				for _, child := range packet.Children[2].Children {
+			if len(response_packet.Children) == 3 {
+				for _, child := range response_packet.Children[2].Children {
 					result.Controls = append(result.Controls, DecodeControl(child))
 				}
 			}
 			foundSearchResultDone = true
 		case 19:
-			result.Referrals = append(result.Referrals, packet.Children[1].Children[0].Value.(string))
+			result.Referrals = append(result.Referrals, response_packet.Children[1].Children[0].Value.(string))
 		}
 	}
 	if l.Debug {
-		fmt.Printf("%d: returning\n", messageID)
+		fmt.Printf("%d: returning\n", request_id)
 	}
-
 	return result, nil
 }

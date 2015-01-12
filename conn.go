@@ -10,22 +10,17 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"sync"
 
 	"github.com/mmitton/asn1-ber"
 )
 
 // LDAP Connection
 type Conn struct {
-	conn  net.Conn
-	isSSL bool
-	Debug bool
-
-	chanResults        map[uint64]chan *ber.Packet
-	chanProcessMessage chan *messagePacket
-	chanMessageID      chan uint64
-
-	closeLock sync.Mutex
+	isClosed        bool
+	next_message_id uint64
+	conn            net.Conn
+	isSSL           bool
+	Debug           bool
 }
 
 // Dial connects to the given address on the given network using net.Dial
@@ -35,9 +30,7 @@ func Dial(network, addr string) (*Conn, *Error) {
 	if err != nil {
 		return nil, NewError(ErrorNetwork, err)
 	}
-	conn := NewConn(c)
-	conn.start()
-	return conn, nil
+	return newConn(c), nil
 }
 
 // Dial connects to the given address on the given network using net.Dial
@@ -47,10 +40,8 @@ func DialSSL(network, addr string) (*Conn, *Error) {
 	if err != nil {
 		return nil, NewError(ErrorNetwork, err)
 	}
-	conn := NewConn(c)
+	conn := newConn(c)
 	conn.isSSL = true
-
-	conn.start()
 	return conn, nil
 }
 
@@ -61,97 +52,77 @@ func DialTLS(network, addr string) (*Conn, *Error) {
 	if err != nil {
 		return nil, NewError(ErrorNetwork, err)
 	}
-	conn := NewConn(c)
-
+	conn := newConn(c)
 	err = conn.startTLS()
 	if err != nil {
 		conn.Close()
 		return nil, NewError(ErrorNetwork, err)
 	}
-	conn.start()
 	return conn, nil
 }
 
 // NewConn returns a new Conn using conn for network I/O.
-func NewConn(conn net.Conn) *Conn {
+func newConn(conn net.Conn) *Conn {
 	return &Conn{
-		conn:               conn,
-		isSSL:              false,
-		Debug:              false,
-		chanResults:        map[uint64]chan *ber.Packet{},
-		chanProcessMessage: make(chan *messagePacket),
-		chanMessageID:      make(chan uint64),
+		isClosed: false,
+		conn:     conn,
+		isSSL:    false,
+		Debug:    false,
 	}
-}
-
-func (l *Conn) start() {
-	go l.reader()
-	go l.processMessages()
 }
 
 // Close closes the connection.
-func (l *Conn) Close() *Error {
-	l.closeLock.Lock()
-	defer l.closeLock.Unlock()
-
-	l.sendProcessMessage(&messagePacket{Op: MessageQuit})
-
-	if l.conn != nil {
-		err := l.conn.Close()
-		if err != nil {
-			return NewError(ErrorNetwork, err)
-		}
-		l.conn = nil
+func (l *Conn) Close() {
+	if !l.isClosed {
+		l.conn.Close()
+		l.isClosed = true
 	}
-	return nil
 }
 
 // Returns the next available messageID
-func (l *Conn) nextMessageID() (messageID uint64) {
-	defer func() {
-		if r := recover(); r != nil {
-			messageID = 0
-		}
-	}()
-	messageID = <-l.chanMessageID
-	return
+func (l *Conn) nextMessageID() uint64 {
+	l.next_message_id++
+	return l.next_message_id
 }
 
 // StartTLS sends the command to start a TLS session and then creates a new TLS Client
 func (l *Conn) startTLS() *Error {
-	messageID := l.nextMessageID()
+	request_id := l.nextMessageID()
 
 	if l.isSSL {
 		return NewError(ErrorNetwork, errors.New("Already encrypted"))
 	}
 
-	packet := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "LDAP Request")
-	packet.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimative, ber.TagInteger, messageID, "MessageID"))
+	request_packet := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "LDAP Request")
+	request_packet.AppendChild(ber.NewInteger(ber.ClassUniversal, ber.TypePrimative, ber.TagInteger, request_id, "MessageID"))
 	startTLS := ber.Encode(ber.ClassApplication, ber.TypeConstructed, ApplicationExtendedRequest, nil, "Start TLS")
 	startTLS.AppendChild(ber.NewString(ber.ClassContext, ber.TypePrimative, 0, "1.3.6.1.4.1.1466.20037", "TLS Extended Command"))
-	packet.AppendChild(startTLS)
+	request_packet.AppendChild(startTLS)
 	if l.Debug {
-		ber.PrintPacket(packet)
+		ber.PrintPacket(request_packet)
 	}
 
-	_, err := l.conn.Write(packet.Bytes())
+	_, err := l.conn.Write(request_packet.Bytes())
 	if err != nil {
 		return NewError(ErrorNetwork, err)
 	}
 
-	packet, err = ber.ReadPacket(l.conn)
+	response_packet, err := ber.ReadPacket(l.conn)
 	if err != nil {
 		return NewError(ErrorNetwork, err)
 	}
+	// if response_id != request_id {
+	// 	return NewError(LDAPResultProtocolError, "reponse id is not expected.")
+	// }
 
 	if l.Debug {
-		if err := addLDAPDescriptions(packet); err != nil {
+		if err := addLDAPDescriptions(response_packet); err != nil {
 			return NewError(ErrorDebugging, err)
 		}
-		ber.PrintPacket(packet)
+		ber.PrintPacket(response_packet)
 	}
 
-	if packet.Children[1].Children[0].Value.(uint64) == 0 {
+	if response_packet.Children[1].Children[0].Value.(uint64) == 0 {
 		conn := tls.Client(l.conn, nil)
 		l.isSSL = true
 		l.conn = conn
@@ -160,161 +131,27 @@ func (l *Conn) startTLS() *Error {
 	return nil
 }
 
-const (
-	MessageQuit     = 0
-	MessageRequest  = 1
-	MessageResponse = 2
-	MessageFinish   = 3
-)
-
-type messagePacket struct {
-	Op        int
-	MessageID uint64
-	Packet    *ber.Packet
-	Channel   chan *ber.Packet
-}
-
-func (l *Conn) sendMessage(p *ber.Packet) (out chan *ber.Packet, err *Error) {
-	message_id := p.Children[0].Value.(uint64)
-	out = make(chan *ber.Packet)
-
-	if l.chanProcessMessage == nil {
-		err = NewError(ErrorNetwork, errors.New("Connection closed"))
-		return
-	}
-	message_packet := &messagePacket{Op: MessageRequest, MessageID: message_id, Packet: p, Channel: out}
-	l.sendProcessMessage(message_packet)
-	return
-}
-
-func (l *Conn) processMessages() {
-	defer l.closeAllChannels()
-
-	var message_id uint64 = 1
-	var message_packet *messagePacket
-	for {
-		select {
-		case l.chanMessageID <- message_id:
-			if l.conn == nil {
-				return
-			}
-			message_id++
-		case message_packet = <-l.chanProcessMessage:
-			if l.conn == nil {
-				return
-			}
-			switch message_packet.Op {
-			case MessageQuit:
-				// Close all channels and quit
-				if l.Debug {
-					fmt.Printf("Shutting down\n")
-				}
-				return
-			case MessageRequest:
-				// Add to message list and write to network
-				if l.Debug {
-					fmt.Printf("Sending message %d\n", message_packet.MessageID)
-				}
-				l.chanResults[message_packet.MessageID] = message_packet.Channel
-				buf := message_packet.Packet.Bytes()
-				for len(buf) > 0 {
-					n, err := l.conn.Write(buf)
-					if err != nil {
-						if l.Debug {
-							fmt.Printf("Error Sending Message: %s\n", err)
-						}
-						return
-					}
-					if n == len(buf) {
-						break
-					}
-					buf = buf[n:]
-				}
-			case MessageResponse:
-				// Pass back to waiting goroutine
-				if l.Debug {
-					fmt.Printf("Receiving message %d\n", message_packet.MessageID)
-				}
-				chanResult := l.chanResults[message_packet.MessageID]
-				if chanResult == nil {
-					fmt.Printf("Unexpected Message Result: %d\n", message_id)
-					ber.PrintPacket(message_packet.Packet)
-				} else {
-					go func() { chanResult <- message_packet.Packet }()
-					// chanResult <- message_packet.Packet
-				}
-			case MessageFinish:
-				// Remove from message list
-				if l.Debug {
-					fmt.Printf("Finished message %d\n", message_packet.MessageID)
-				}
-				l.chanResults[message_packet.MessageID] = nil
-			}
-		}
-	}
-}
-
-func (l *Conn) closeAllChannels() {
-	if l.Debug {
-		fmt.Printf("closeAllChannels\n")
-	}
-	for MessageID, Channel := range l.chanResults {
-		if l.Debug {
-			fmt.Printf("Closing channel for MessageID %d\n", MessageID)
-		}
-		close(Channel)
-		l.chanResults[MessageID] = nil
-	}
-	close(l.chanMessageID)
-	l.chanMessageID = nil
-
-	close(l.chanProcessMessage)
-	l.chanProcessMessage = nil
-}
-
-func (l *Conn) finishMessage(MessageID uint64) {
-	message_packet := &messagePacket{Op: MessageFinish, MessageID: MessageID}
-	l.sendProcessMessage(message_packet)
-}
-
-func (l *Conn) reader() {
-	defer l.Close()
-	for {
-		p, err := ber.ReadPacket(l.conn)
+func (l *Conn) send(message *ber.Packet) error {
+	buf := message.Bytes()
+	for len(buf) > 0 {
+		n, err := l.conn.Write(buf)
 		if err != nil {
 			if l.Debug {
-				fmt.Printf("ldap.reader: %s\n", err)
+				fmt.Printf("Error Sending Message: %s\n", err)
 			}
-			return
+			return err
 		}
-
-		addLDAPDescriptions(p)
-
-		message_id := p.Children[0].Value.(uint64)
-		message_packet := &messagePacket{Op: MessageResponse, MessageID: message_id, Packet: p}
-		if l.chanProcessMessage != nil {
-			l.chanProcessMessage <- message_packet
-		} else {
-			fmt.Printf("ldap.reader: Cannot return message\n")
-			return
+		if n == len(buf) {
+			break
 		}
+		buf = buf[n:]
 	}
+	return nil
 }
-
-func (l *Conn) sendProcessMessage(message *messagePacket) {
-	if l.chanProcessMessage != nil {
-		//go func() {
-		select {
-		case l.chanProcessMessage <- message:
-		default:
-			go func() {
-				defer func() {
-					if o := recover(); nil != o {
-						fmt.Println("[ldap] panic at", o)
-					}
-				}()
-				l.chanProcessMessage <- message
-			}()
-		}
+func (l *Conn) read() (uint64, *ber.Packet, error) {
+	p, err := ber.ReadPacket(l.conn)
+	if err != nil {
+		return 0, p, err
 	}
+	return p.Children[0].Value.(uint64), p, nil
 }
