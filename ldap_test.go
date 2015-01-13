@@ -92,6 +92,7 @@ func testMultiGoroutineSearch(t *testing.T, l *Conn, results chan *SearchResult,
 	sr, err := l.Search(search_request)
 
 	if err != nil {
+		fmt.Println(err)
 		t.Error(err)
 		results <- nil
 		return
@@ -109,13 +110,12 @@ func TestMultiGoroutineSearch(t *testing.T) {
 	}
 	defer l.Close()
 
-	results := make([]chan *SearchResult, len(filter))
+	// currency is not supported!
 	for i := range filter {
-		results[i] = make(chan *SearchResult)
-		go testMultiGoroutineSearch(t, l, results[i], i)
-	}
-	for i := range filter {
-		sr := <-results[i]
+		result := make(chan *SearchResult)
+		go testMultiGoroutineSearch(t, l, result, i)
+
+		sr := <-result
 		if sr == nil {
 			t.Errorf("Did not receive results from goroutine for %q", filter[i])
 		} else {

@@ -31,5 +31,5 @@ func TestConnectApacheDS(t *testing.T) {
 		return
 	}
 
-	fmt.Printf("TestSearchWithPaging: %s -> num of entries = %d\n", search_request.Filter, len(sr.Entries))
+	fmt.Printf("TestConnectApacheDS: %s -> num of entries = %d\n", search_request.Filter, len(sr.Entries))
 }
